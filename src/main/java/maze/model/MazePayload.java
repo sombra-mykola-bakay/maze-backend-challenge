@@ -23,8 +23,8 @@ public class MazePayload {
     this.toUserId = toUserId;
   }
 
-  public Optional<Long> getSequence() {
-    return Optional.ofNullable(sequence);
+  public Long getSequence() {
+    return sequence;
   }
 
   public PayloadType getPayloadType() {
@@ -60,6 +60,18 @@ public class MazePayload {
     return new MazePayload(Long.valueOf(parts[0]), PayloadType.fromAlias(parts[1]),
         Long.valueOf(parts[2]),
         Long.valueOf(parts[3]));
+  }
+
+  public String toPayload() {
+
+    String payloadInternal = sequence + "|" + payloadType.alias;
+    if (fromUserId != null) {
+      payloadInternal = payloadInternal + "|" + fromUserId;
+    }
+    if (toUserId != null) {
+      payloadInternal = payloadInternal + "|" + toUserId;
+    }
+    return payloadInternal+ "\n";
   }
 
   public enum PayloadType {

@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import maze.model.MazePayload;
 import maze.model.MazePayload.PayloadType;
 import maze.util.StringUtil;
-import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +37,8 @@ import org.slf4j.LoggerFactory;
 public class MazeServer {
 
   private static final Logger LOGGER = LoggerFactory.getLogger("GENERAL");
+  private static final Logger TRANSPORT_LOGGER = LoggerFactory.getLogger("TRANSPORT");
+
   private static final String INTERFACE = "127.0.0.1";
   private static final int CLIENT_PORT = 9099;
   private static final int SERVER_PORT = 9090;
@@ -70,13 +71,13 @@ public class MazeServer {
           .toMat(Sink.asPublisher(AsPublisher.WITH_FANOUT), Keep.both()).run(materializer);
 
       //Infinite source backed by publisher
-      Source<ByteString, NotUsed> source = Source
+      Source<MazePayload, NotUsed> source = Source
           .fromPublisher(eventSourceActorAndPublisher.second())
-          .map(object -> (ByteString) object)
-          .toMat(BroadcastHub.of(ByteString.class, 2048), Keep.right()).run(materializer);
+          .map(object -> (MazePayload) object)
+          .toMat(BroadcastHub.of(MazePayload.class, 2048), Keep.right()).run(materializer);
 
       //Set up event publisher connection handling
-      setUpEventPublisher(system, materializer, eventSourceActorAndPublisher);
+      setUpEventPublisher(system, materializer, eventSourceActorAndPublisher.first());
 
       //Set up client connection handling
       setUpClient(system, materializer, source);
@@ -88,19 +89,23 @@ public class MazeServer {
     }
   }
 
+
   private static void setUpEventPublisher(ActorSystem system, Materializer materializer,
-      Pair<ActorRef, Publisher<Object>> eventSourceActorAndPublisher) {
+      ActorRef actorPublisher) {
+
     //Initialize connection handling
     Tcp.get(system).bind(INTERFACE, SERVER_PORT).runForeach(connection -> {
 
-      LOGGER.info(NEW_CONNECTION_FROM + SERVER_PORT + COLON + connection.remoteAddress());
+      LOGGER.debug(NEW_CONNECTION_FROM + SERVER_PORT + COLON + connection.remoteAddress());
       AtomicLong counter = new AtomicLong(0);
 
       //Publisher sink
       final Sink<ByteString, CompletionStage<Done>> dataPublisherSink = Sink.foreach(message -> {
-            eventSourceActorAndPublisher.first().tell(message, ActorRef.noSender());
-            LOGGER.info(MESSAGE + CLIENT_PORT + COLON + message.utf8String());
-            LOGGER.info(NUMBER_OF_EVENTS_RECEIVED + counter.incrementAndGet());
+            actorPublisher
+                .tell(MazePayload.fromPayload(StringUtil.removeControlCharacters(message.utf8String())),
+                    ActorRef.noSender());
+            LOGGER.debug(MESSAGE + SERVER_PORT + COLON + message.utf8String());
+            LOGGER.debug(NUMBER_OF_EVENTS_RECEIVED + counter.incrementAndGet());
           }
       );
 
@@ -110,21 +115,19 @@ public class MazeServer {
               FramingTruncation.DISALLOW);
 
       final Sink<ByteString, NotUsed> completionSink = Sink.onComplete(
-          completion -> LOGGER.info(EVENT_PUBLISHER_COMPLETED + completion));
+          completion -> LOGGER.debug(EVENT_PUBLISHER_COMPLETED + completion + counter.get()));
 
-      //Event publisher flow
-      final Flow<ByteString, ByteString, NotUsed> eventPublisherFlow =
-          Flow.of(ByteString.class)
-              .via(delimiter)
-              .alsoTo(dataPublisherSink)
-              .alsoTo(completionSink);
+      //TODO runtime source sorting
+      //Event publisher
+      connection
+          .flow().via(delimiter).alsoTo(dataPublisherSink).alsoTo(completionSink)
+          .runWith(Source.maybe(), Sink.ignore(), materializer);
 
-      connection.handleWith(eventPublisherFlow, materializer);
     }, materializer);
   }
 
   private static void setUpClient(ActorSystem system, Materializer materializer,
-      Source<ByteString, NotUsed> source) {
+      Source<MazePayload, NotUsed> source) {
 
     Tcp.get(system).bind(INTERFACE, CLIENT_PORT).runForeach(connection -> {
       AtomicReference<Long> userId = new AtomicReference<>(null);
@@ -133,39 +136,38 @@ public class MazeServer {
       final Sink<ByteString, CompletionStage<Done>> updateUserIdSink = Sink.foreach(message -> {
             final Optional<Long> userIdOption = Optional.ofNullable(message).map(ByteString::utf8String)
                 .map(StringUtil::removeControlCharacters).map(Long::valueOf);
-            LOGGER.info(USER + userIdOption.orElse(null));
+            LOGGER.debug(USER + userIdOption.orElse(null));
             userIdOption.ifPresent(userId::set);
           }
 
       );
-
-      LOGGER.info(NEW_CONNECTION_FROM + CLIENT_PORT +
+      LOGGER.debug(NEW_CONNECTION_FROM + CLIENT_PORT +
           COLON + connection.remoteAddress());
 
-      final Sink<ByteString, CompletionStage<Done>> loggerSink = Sink.foreach(event -> LOGGER.info(
-          SENDING + event
-              .utf8String() + TO_USER + userId.get()));
+      final Sink<ByteString, CompletionStage<Done>> loggerSink = Sink.foreach(event -> TRANSPORT_LOGGER.debug(
+          SENDING + StringUtil.removeControlCharacters(event
+              .utf8String()) + TO_USER + userId.get()));
 
       final Sink<ByteString, NotUsed> completionSink = Sink
           .onComplete(
-              completion -> LOGGER.info(CLIENT_COMPLETED + userId.get() + SPACE + completion));
+              completion -> LOGGER.debug(CLIENT_COMPLETED + userId.get() + SPACE + completion));
 
       Set<Long> following = Collections.synchronizedSet(new HashSet<>());
-      final Sink<ByteString, CompletionStage<Done>> followerSink = resolveFollowers(userId,
+
+      final Sink<MazePayload, CompletionStage<Done>> followerSink = resolveFollowersSink(userId,
           following);
 
-
-      //FIXME Should be piped sequentially
-      source.to(followerSink).run(materializer);
-
       //Pipe dynamic source content to clients
-      source.filter(value ->
-          shouldReceiveMessage(userId, value, following)
-      ).alsoTo(loggerSink)
-          .via(connection.flow())
-          .alsoTo(completionSink)
-          .to(updateUserIdSink)
-          .run(materializer);
+      connection.flow().to(updateUserIdSink)
+          .runWith(
+              source
+                  .alsoTo(Flow.of(MazePayload.class).to(followerSink))
+                  .filter(value ->
+                      shouldReceiveMessage(userId, value, following))
+                  .map(MazePayload::toPayload)
+                  .map(ByteString::fromString)
+                  .alsoTo(Flow.of(ByteString.class).to(loggerSink)).alsoTo(completionSink),
+              materializer);
 
     }, materializer);
 
@@ -174,9 +176,8 @@ public class MazeServer {
 
   //Filter messages based on event rules
   private static boolean shouldReceiveMessage(
-      AtomicReference<Long> userId, ByteString value, Set<Long> following) {
+      AtomicReference<Long> userId, MazePayload mazePayload, Set<Long> following) {
     try {
-      final MazePayload mazePayload = MazePayload.fromPayload(value.utf8String());
 
       if (mazePayload.getPayloadType() == PayloadType.UNFOLLOW) {
         return false;
@@ -187,11 +188,11 @@ public class MazeServer {
 
       if (mazePayload.getPayloadType() == PayloadType.STATUS_UPDATE
       ) {
-        return mazePayload.getFromUserId().map(following::contains).orElse(false);
+        return  mazePayload
+            .getFromUserId().map(following::contains).orElse(false);
       }
       if (mazePayload.getPayloadType() == PayloadType.PRIVATE_MSG
           || mazePayload.getPayloadType() == PayloadType.FOLLOW) {
-
         return Optional.ofNullable(userId.get())
             .map(uId -> uId.equals(mazePayload.getToUserId().orElse(null))).orElse(false);
       }
@@ -202,32 +203,38 @@ public class MazeServer {
     }
   }
 
-  private static Sink<ByteString, CompletionStage<Done>> resolveFollowers(
+  private static Sink<MazePayload, CompletionStage<Done>> resolveFollowersSink(
       AtomicReference<Long> userId, Set<Long> following) {
-    //Handle follow unfollow
-    return Sink.foreach(message -> {
-          final MazePayload mazePayload = MazePayload.fromPayload(message.utf8String());
+    return Sink.foreach(mazePayload -> resolveFollowers(userId, following, mazePayload));
+  }
 
-          if (mazePayload.getPayloadType() == PayloadType.FOLLOW
-              && mazePayload.getToUserId().isPresent() && Optional.ofNullable(userId.get())
-              .map(v -> v.equals(mazePayload.getToUserId().orElse(null))).orElse(false)
-          ) {
-            LOGGER.info(USER + userId.get() + IS_FOLLOWING + mazePayload.getFromUserId()
-                .orElse(null));
-            mazePayload.getFromUserId().ifPresent(following::add);
-          }
+  //Handle follow unfollow
+  private static void resolveFollowers(AtomicReference<Long> userId, Set<Long> following,
+      MazePayload mazePayload) {
 
-          if (mazePayload.getPayloadType() == PayloadType.UNFOLLOW && mazePayload.getFromUserId()
-              .isPresent() && Optional.ofNullable(userId.get())
-              .map(v -> v.equals(mazePayload.getToUserId().orElse(null))).orElse(false)
-          ) {
-            LOGGER.info(
-                USER + userId.get() + UNFOLLOWED + mazePayload.getFromUserId().orElse(null));
+    if (mazePayload.getPayloadType() == PayloadType.FOLLOW
+        && mazePayload.getToUserId().isPresent() && Optional.ofNullable(userId.get())
+        .map(v -> v.equals(mazePayload.getFromUserId().orElse(null)))
+        .orElse(false)
+    ) {
+      LOGGER.debug(USER + userId.get() + IS_FOLLOWING + mazePayload
+          .getToUserId()
+          .orElse(null));
 
-            mazePayload.getFromUserId().ifPresent(following::remove);
-          }
-        }
-    );
+      mazePayload.getToUserId().ifPresent(following::add);
+    }
+
+    if (mazePayload.getPayloadType() == PayloadType.UNFOLLOW && mazePayload.getFromUserId()
+        .isPresent() && Optional.ofNullable(userId.get())
+        .map(v -> v.equals(mazePayload.getFromUserId().orElse(null)))
+        .orElse(false)
+    ) {
+      LOGGER.debug(
+          USER + userId.get() + UNFOLLOWED + mazePayload
+              .getToUserId().orElse(null));
+
+      mazePayload.getToUserId().ifPresent(following::remove);
+    }
   }
 
 }
